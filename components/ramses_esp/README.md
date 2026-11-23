@@ -11,8 +11,9 @@ again.
 ```yaml
 external_components:
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/VinnyEatWorld/ramses_esp
+      ref: esphome-m5stack-core
     components: [ramses_esp]
 
 spi:
