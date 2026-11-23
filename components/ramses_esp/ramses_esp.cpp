@@ -7,6 +7,12 @@ namespace esphome {
 namespace ramses_esp {
 
 static const char *const TAG = "ramses_esp";
+static const uint32_t CC1101_RESET_TIMEOUT_MS = 100;
+
+struct RegisterCheck {
+  uint8_t address;
+  const char *name;
+};
 
 void RamsesEsp::setup() {
   this->spi_setup();
@@ -53,10 +59,21 @@ bool RamsesEsp::initialize_cc1101_() {
   // spi_setup() has already set CS high. Reset the radio before reading status
   // registers, as required after power-up.
   this->strobe_(CC_SRES);
-  delay(1);
 
-  uint8_t part_number = this->read_register_(CC_PARTNUM);
-  uint8_t version = this->read_register_(CC_VERSION);
+  const uint32_t reset_started = millis();
+  uint8_t status = this->strobe_(CC_SNOP);
+  while ((status & CC_CHIP_RDY) != 0 && (millis() - reset_started) < CC1101_RESET_TIMEOUT_MS) {
+    delay(1);
+    status = this->strobe_(CC_SNOP);
+  }
+  if ((status & CC_CHIP_RDY) != 0) {
+    ESP_LOGE(TAG, "CC1101 CHIP_RDYn timeout after %u ms (status=0x%02X)",
+             static_cast<unsigned>(CC1101_RESET_TIMEOUT_MS), status);
+    return false;
+  }
+
+  const uint8_t part_number = this->read_register_(CC_PARTNUM);
+  const uint8_t version = this->read_register_(CC_VERSION);
 
   // A fully floating MISO line commonly reads as all ones. Do not reject a
   // specific silicon revision: compatible CC1101 modules can report variants.
@@ -88,11 +105,30 @@ bool RamsesEsp::initialize_cc1101_() {
     this->write_register_(CC_PATABLE, pa_table[i]);
   }
 
-  // Read back the frequency profile so an absent or misrouted MISO line does
-  // not look like a successful initialization.
-  if (this->read_register_(CC_FREQ2) != config[CC_FREQ2]) {
-    ESP_LOGE(TAG, "CC1101 profile readback failed (FREQ2=0x%02X)", this->read_register_(CC_FREQ2));
-    return false;
+  // Check the programmed RF frequency, synthesizer, modulation, and packet
+  // profile. The FIFO threshold entry uses the adjusted value written above.
+  static const RegisterCheck checks[] = {
+      {CC_FIFOTHR, "FIFOTHR"}, {CC_PKTLEN, "PKTLEN"},       {CC_PKTCTRL1, "PKTCTRL1"},
+      {CC_PKTCTRL0, "PKTCTRL0"}, {CC_FSCTRL1, "FSCTRL1"},   {CC_FSCTRL0, "FSCTRL0"},
+      {CC_FREQ2, "FREQ2"},       {CC_FREQ1, "FREQ1"},       {CC_FREQ0, "FREQ0"},
+      {CC_MDMCFG4, "MDMCFG4"},   {CC_MDMCFG3, "MDMCFG3"},   {CC_MDMCFG2, "MDMCFG2"},
+      {CC_MDMCFG1, "MDMCFG1"},   {CC_MDMCFG0, "MDMCFG0"},   {CC_DEVIATN, "DEVIATN"},
+      {CC_MCSM0, "MCSM0"},       {CC_AGCCTRL2, "AGCCTRL2"}, {CC_AGCCTRL1, "AGCCTRL1"},
+      {CC_AGCCTRL0, "AGCCTRL0"},
+  };
+
+  for (const auto &check : checks) {
+    uint8_t expected = config[check.address];
+    if (check.address == CC_FIFOTHR) {
+      expected = (expected & 0xF0) | 11;
+    }
+
+    const uint8_t actual = this->read_register_(check.address);
+    if (actual != expected) {
+      ESP_LOGE(TAG, "CC1101 register %s (0x%02X) mismatch: expected 0x%02X, read 0x%02X",
+               check.name, check.address, expected, actual);
+      return false;
+    }
   }
 
   // Leave the radio in idle. The later frame component will explicitly start
