@@ -8,6 +8,8 @@ namespace ramses_esp {
 
 static const char *const TAG = "ramses_esp";
 static const uint32_t CC1101_RESET_TIMEOUT_MS = 100;
+static const uint8_t CC_MARCSTATE_IDLE = 0x01;
+static const uint8_t CC_MARCSTATE_MASK = 0x1F;
 
 struct RegisterCheck {
   uint8_t address;
@@ -108,13 +110,15 @@ bool RamsesEsp::initialize_cc1101_() {
   // Check the programmed RF frequency, synthesizer, modulation, and packet
   // profile. The FIFO threshold entry uses the adjusted value written above.
   static const RegisterCheck checks[] = {
-      {CC_FIFOTHR, "FIFOTHR"}, {CC_PKTLEN, "PKTLEN"},       {CC_PKTCTRL1, "PKTCTRL1"},
-      {CC_PKTCTRL0, "PKTCTRL0"}, {CC_FSCTRL1, "FSCTRL1"},   {CC_FSCTRL0, "FSCTRL0"},
-      {CC_FREQ2, "FREQ2"},       {CC_FREQ1, "FREQ1"},       {CC_FREQ0, "FREQ0"},
-      {CC_MDMCFG4, "MDMCFG4"},   {CC_MDMCFG3, "MDMCFG3"},   {CC_MDMCFG2, "MDMCFG2"},
-      {CC_MDMCFG1, "MDMCFG1"},   {CC_MDMCFG0, "MDMCFG0"},   {CC_DEVIATN, "DEVIATN"},
-      {CC_MCSM0, "MCSM0"},       {CC_AGCCTRL2, "AGCCTRL2"}, {CC_AGCCTRL1, "AGCCTRL1"},
-      {CC_AGCCTRL0, "AGCCTRL0"},
+      {CC_IOCFG2, "IOCFG2"},     {CC_IOCFG0, "IOCFG0"},     {CC_FIFOTHR, "FIFOTHR"},
+      {CC_SYNC1, "SYNC1"},       {CC_SYNC0, "SYNC0"},       {CC_PKTLEN, "PKTLEN"},
+      {CC_PKTCTRL1, "PKTCTRL1"}, {CC_PKTCTRL0, "PKTCTRL0"}, {CC_CHANNR, "CHANNR"},
+      {CC_FSCTRL1, "FSCTRL1"},   {CC_FSCTRL0, "FSCTRL0"},   {CC_FREQ2, "FREQ2"},
+      {CC_FREQ1, "FREQ1"},       {CC_FREQ0, "FREQ0"},       {CC_MDMCFG4, "MDMCFG4"},
+      {CC_MDMCFG3, "MDMCFG3"},   {CC_MDMCFG2, "MDMCFG2"},   {CC_MDMCFG1, "MDMCFG1"},
+      {CC_MDMCFG0, "MDMCFG0"},   {CC_DEVIATN, "DEVIATN"},   {CC_MCSM1, "MCSM1"},
+      {CC_MCSM0, "MCSM0"},       {CC_FOCCFG, "FOCCFG"},     {CC_BSCFG, "BSCFG"},
+      {CC_AGCCTRL2, "AGCCTRL2"}, {CC_AGCCTRL1, "AGCCTRL1"}, {CC_AGCCTRL0, "AGCCTRL0"},
   };
 
   for (const auto &check : checks) {
@@ -134,6 +138,13 @@ bool RamsesEsp::initialize_cc1101_() {
   // Leave the radio in idle. The later frame component will explicitly start
   // RX after its UART/GDO path is ready.
   this->strobe_(CC_SIDLE);
+  const uint8_t marcstate = this->read_register_(CC_MARCSTATE);
+  if ((marcstate & CC_MARCSTATE_MASK) != CC_MARCSTATE_IDLE) {
+    ESP_LOGE(TAG, "CC1101 MARCSTATE is not IDLE after initialization: expected 0x%02X, read 0x%02X",
+             CC_MARCSTATE_IDLE, marcstate & CC_MARCSTATE_MASK);
+    return false;
+  }
+  ESP_LOGI(TAG, "CC1101 MARCSTATE=0x%02X (IDLE)", marcstate & CC_MARCSTATE_MASK);
   return true;
 }
 
