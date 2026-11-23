@@ -1,0 +1,31 @@
+# Compile/configuration example for the M5Stack Core Basic + M5Stack M146.
+# Route the M146 CSN DIP switch to M5-Bus pin 8 (GPIO25) for this example.
+# Route the module's GDO lines separately if/when enabling the UART radio path.
+# If your ESPHome node already defines this SPI bus, reuse that bus and its ID.
+esphome:
+  name: ramses-esp-core-basic
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [ramses_esp]
+
+
+esp32:
+  board: m5stack-core-esp32
+  framework:
+    type: arduino
+
+logger:
+
+spi:
+  id: ramses_spi
+  clk_pin: 18
+  mosi_pin: 23
+  miso_pin: 19
+
+ramses_esp:
+  id: ramses_gateway_radio
+  spi_id: ramses_spi
+  cs_pin: 25
