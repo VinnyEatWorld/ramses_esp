@@ -35,19 +35,19 @@ void RamsesEsp::dump_config() {
 }
 
 uint8_t RamsesEsp::read_register_(uint8_t address) {
-  uint8_t data[2] = {static_cast<uint8_t>(address | CC_READ), 0x00};
   this->enable();
-  this->transfer_array(data, sizeof(data));
+  this->write_byte(static_cast<uint8_t>(address | CC_READ));
+  const uint8_t value = this->read_byte();
   this->disable();
-  return data[1];
+  return value;
 }
 
 uint8_t RamsesEsp::write_register_(uint8_t address, uint8_t value) {
-  uint8_t data[2] = {address, value};
   this->enable();
-  this->transfer_array(data, sizeof(data));
+  const uint8_t status = this->transfer_byte(address);
+  this->write_byte(value);
   this->disable();
-  return data[0];
+  return status;
 }
 
 uint8_t RamsesEsp::strobe_(uint8_t command) {
