@@ -1,5 +1,6 @@
 #include "ramses_esp.h"
 
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "cc1101_param.h"
 
@@ -35,19 +36,24 @@ void RamsesEsp::dump_config() {
 }
 
 uint8_t RamsesEsp::read_register_(uint8_t address) {
+  // Keep the two-byte CC1101 read as one SPI transaction, matching the
+  // upstream driver. Separate TX/RX buffers avoid relying on in-place full
+  // duplex behavior in the ESPHome SPI backend.
+  const uint8_t tx[2] = {static_cast<uint8_t>(address | CC_READ), 0x00};
+  uint8_t rx[2] = {0x00, 0x00};
   this->enable();
-  this->write_byte(static_cast<uint8_t>(address | CC_READ));
-  const uint8_t value = this->read_byte();
+  this->delegate_->transfer(tx, rx, sizeof(tx));
   this->disable();
-  return value;
+  return rx[1];
 }
 
 uint8_t RamsesEsp::write_register_(uint8_t address, uint8_t value) {
+  const uint8_t tx[2] = {address, value};
+  uint8_t rx[2] = {0x00, 0x00};
   this->enable();
-  const uint8_t status = this->transfer_byte(address);
-  this->write_byte(value);
+  this->delegate_->transfer(tx, rx, sizeof(tx));
   this->disable();
-  return status;
+  return rx[0];
 }
 
 uint8_t RamsesEsp::strobe_(uint8_t command) {
@@ -58,8 +64,16 @@ uint8_t RamsesEsp::strobe_(uint8_t command) {
 }
 
 bool RamsesEsp::initialize_cc1101_() {
-  // spi_setup() has already set CS high. Reset the radio before reading status
-  // registers, as required after power-up.
+  // Port the upstream CSN reset pulse through ESPHome's registered SPI device
+  // so CS remains owned by SPIDevice and the shared SPI bus is not reinitialized.
+  // spi_setup() leaves CS high, as required at the start of this sequence.
+  delayMicroseconds(1);
+  this->enable();
+  delayMicroseconds(10);
+  this->disable();
+  delayMicroseconds(41);
+
+  // Reset the radio before reading status registers.
   this->strobe_(CC_SRES);
 
   const uint32_t reset_started = millis();
@@ -93,13 +107,12 @@ bool RamsesEsp::initialize_cc1101_() {
   }
 
   for (uint8_t reg = 0; reg < config_length; reg++) {
-    uint8_t value = config[reg];
-    if (reg == CC_FIFOTHR) {
-      // Preserve the upstream FIFO threshold setting used by the radio path.
-      value = (value & 0xF0) | 11;
-    }
-    this->write_register_(reg, value);
+    this->write_register_(reg, config[reg]);
   }
+
+  // Match upstream: program the FIFO threshold override after the full profile.
+  const uint8_t fifo_threshold = (config[CC_FIFOTHR] & 0xF0) | 11;
+  this->write_register_(CC_FIFOTHR, fifo_threshold);
 
   uint8_t pa_table[CC_PA_MAX];
   const uint8_t pa_length = cc_pa_get(pa_table);
@@ -108,7 +121,7 @@ bool RamsesEsp::initialize_cc1101_() {
   }
 
   // Check the programmed RF frequency, synthesizer, modulation, and packet
-  // profile. The FIFO threshold entry uses the adjusted value written above.
+  // profile. FIFOTHR uses the upstream override written after the profile.
   static const RegisterCheck checks[] = {
       {CC_IOCFG2, "IOCFG2"},     {CC_IOCFG0, "IOCFG0"},     {CC_FIFOTHR, "FIFOTHR"},
       {CC_SYNC1, "SYNC1"},       {CC_SYNC0, "SYNC0"},       {CC_PKTLEN, "PKTLEN"},

@@ -44,11 +44,14 @@ reset level should be measured on the assembled Core Basic + M146. For a
 deployment where that electrical check is unavailable, select a non-strapping
 CSN route and set the corresponding SW1 switch instead.
 
-At setup, the component resets the CC1101, waits at most 100 ms for CHIP_RDYn,
+At setup, the component applies the upstream CSN reset pulse (1 µs high, 10 µs
+low, then 41 µs high) through ESPHome's SPI-device CS control, sends `SRES`, and
+waits at most 100 ms for CHIP_RDYn,
 logs PARTNUM/VERSION and MARCSTATE, writes the existing RAMSES 868.3 MHz
 register and PA profiles, and checks the frequency, modem, packet, sync, and
-AGC configuration by register readback. It verifies MARCSTATE is IDLE and
-leaves the radio there for later frame/UART work.
+AGC configuration by register readback. Register operations follow the
+upstream two-byte SPI transaction shape with separate TX and RX buffers. It
+verifies MARCSTATE is IDLE and leaves the radio there for later frame/UART work.
 
 The RF profile is inherited from `components/cc1101/cc1101_param.c` (also
 vendored as `cc1101_param.c` in this external component). It sets FREQ2/1/0 to
