@@ -1,8 +1,9 @@
 # `ramses_esp` ESPHome component
 
-The initial RX phase configures the CC1101 on an ESPHome SPI bus, starts the
-upstream RAMSES asynchronous GFSK receive mode, and scans ESPHome UART input for
-the RAMSES frame sync word. It does not add TX or MQTT.
+The RX phase configures the CC1101 on an ESPHome SPI bus, starts the upstream
+RAMSES asynchronous GFSK receive mode, and decodes received RAMSES frames from
+ESPHome UART input. It validates Manchester coding, message layout, payload
+length, checksum, and frame trailer. It does not add TX or MQTT.
 
 The component requires an ESPHome `spi:` bus with MOSI and MISO, a separate CS
 pin, and an ESPHome `uart:` bus configured for 38400 baud, 8 data bits, no
@@ -58,17 +59,22 @@ CSN route and set the corresponding SW1 switch instead.
 
 At setup, the component applies the upstream CSN reset pulse (1 µs high, 10 µs
 low, then 41 µs high) through ESPHome's SPI-device CS control, sends `SRES`, and
-waits at most 100 ms for CHIP_RDYn,
-logs PARTNUM/VERSION and MARCSTATE, writes the existing RAMSES 868.3 MHz
+waits at most 100 ms for CHIP_RDYn, logs PARTNUM/VERSION and MARCSTATE, writes the existing RAMSES 868.3 MHz
 register and PA profiles, and checks the frequency, modem, packet, sync, and
 AGC configuration by register readback. Register operations follow the
 upstream two-byte SPI transaction shape with separate TX and RX buffers. It
 then applies the upstream asynchronous RX settings (`IOCFG0=0x2E`,
 `PKTCTRL0=0x32`), flushes the RX FIFO, starts RX, and verifies `MARCSTATE=RX`.
-The ESPHome main loop drains UART bytes non-blockingly, reports UART byte and
-sync counters every five seconds, and logs each detection of the upstream
-RAMSES sync sequence `00 33 55 53`; this phase does not decode message payloads
-yet.
+The ESPHome main loop drains UART bytes non-blockingly, scans for the upstream
+RAMSES sync sequence `00 33 55 53`, applies the same Manchester nibble mapping
+and message-field order as `components/frame/frame.c` and
+`components/message/message.c`, and accepts a frame only when the message is
+complete, its 8-bit byte sum including checksum is zero, and the `0x35` trailer
+arrives. Every accepted frame logs message type, all three address slots,
+opcode, payload length, and payload bytes. Rejected frames log the reason;
+five-second debug summaries include byte, sync, valid-frame, and rejected-frame
+counters. Parsing is limited to the upstream `MAX_RAW` and `MAX_PAYLOAD`
+bounds. This phase still does not transmit or publish MQTT.
 
 The RF profile is inherited from `components/cc1101/cc1101_param.c` (also
 vendored as `cc1101_param.c` in this external component). It sets FREQ2/1/0 to

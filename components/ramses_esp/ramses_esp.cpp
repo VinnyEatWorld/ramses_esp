@@ -4,6 +4,8 @@
 #include "esphome/core/log.h"
 #include "cc1101_param.h"
 
+#include <cstdio>
+
 namespace esphome {
 namespace ramses_esp {
 
@@ -16,6 +18,23 @@ static const uint8_t CC_RX_TIMEOUT_MS = 100;
 static const uint8_t CC_PKTCTRL0_ASYNC_INFINITE = 0x32;
 static const uint8_t CC_IOCFG0_UNUSED = 0x2E;
 static const uint32_t RAMSES_SYNC_WORD = 0x00335553;
+static const uint8_t RAMSES_TRAILER = 0x35;
+static const uint8_t RAMSES_MAX_ENCODED_BYTES = 162;
+
+enum RxMessageState : uint8_t {
+  RX_MSG_HEADER,
+  RX_MSG_ADDRESSES,
+  RX_MSG_PARAMS,
+  RX_MSG_OPCODE,
+  RX_MSG_LENGTH,
+  RX_MSG_PAYLOAD,
+  RX_MSG_CHECKSUM,
+  RX_MSG_COMPLETE,
+};
+
+static const uint8_t RAMSES_ADDRESS_MASKS[4] = {0x07, 0x04, 0x05, 0x03};
+static const uint8_t MANCHESTER_DECODE[16] = {0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x03, 0x02, 0x0F,
+                                               0x0F, 0x01, 0x00, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F};
 
 #ifndef RAMSES_ESP_SOURCE_INFO
 #define RAMSES_ESP_SOURCE_INFO "source metadata unavailable"
@@ -51,9 +70,11 @@ void RamsesEsp::loop() {
 
   const uint32_t now = millis();
   if (now - this->rx_report_ms_ >= 5000) {
-    ESP_LOGD(TAG, "UART RX bytes=%lu, RAMSES syncs=%lu",
+    ESP_LOGD(TAG, "UART RX bytes=%lu, syncs=%lu, valid frames=%lu, rejected frames=%lu",
              static_cast<unsigned long>(this->rx_byte_count_),
-             static_cast<unsigned long>(this->rx_sync_count_));
+             static_cast<unsigned long>(this->rx_sync_count_),
+             static_cast<unsigned long>(this->rx_valid_frame_count_),
+             static_cast<unsigned long>(this->rx_rejected_frame_count_));
     this->rx_report_ms_ = now;
   }
 }
@@ -62,7 +83,7 @@ void RamsesEsp::dump_config() {
   ESP_LOGCONFIG(TAG, "RAMSES ESP:");
   ESP_LOGCONFIG(TAG, "  CC1101 SPI: mode 0, MSB first, 1 MHz");
   ESP_LOGCONFIG(TAG, "  Radio profile: 868.3 MHz GFSK, 38.4 kbaud UART RX");
-  ESP_LOGCONFIG(TAG, "  RX: RAMSES sync detection enabled; TX is not started");
+  ESP_LOGCONFIG(TAG, "  RX: RAMSES Manchester/message validation enabled; TX is not started");
 }
 
 bool RamsesEsp::start_rx_() {
@@ -89,6 +110,8 @@ bool RamsesEsp::start_rx_() {
 
   this->rx_sync_buffer_ = 0;
   this->rx_sync_count_ = 0;
+  this->rx_valid_frame_count_ = 0;
+  this->rx_rejected_frame_count_ = 0;
   this->rx_byte_count_ = 0;
   this->rx_report_ms_ = millis();
   ESP_LOGI(TAG, "CC1101 MARCSTATE=0x%02X (RX); waiting for RAMSES sync 00 33 55 53", marcstate);
@@ -97,12 +120,197 @@ bool RamsesEsp::start_rx_() {
 
 void RamsesEsp::process_rx_byte_(uint8_t byte) {
   this->rx_byte_count_++;
+  if (this->rx_frame_active_) {
+    this->process_rx_frame_byte_(byte);
+    return;
+  }
+
   this->rx_sync_buffer_ = (this->rx_sync_buffer_ << 8) | byte;
   if (this->rx_sync_buffer_ == RAMSES_SYNC_WORD) {
     this->rx_sync_count_++;
-    ESP_LOGI(TAG, "RAMSES sync detected on UART RX (count=%lu)",
+    ESP_LOGI(TAG, "RAMSES sync detected on UART RX (count=%lu); decoding frame",
              static_cast<unsigned long>(this->rx_sync_count_));
+    this->reset_rx_frame_();
+    this->rx_frame_active_ = true;
   }
+}
+
+void RamsesEsp::process_rx_frame_byte_(uint8_t byte) {
+  // Upstream frame.c recognizes the non-Manchester trailer before decoding
+  // the data stream. A complete message must also pass its checksum.
+  if (byte == RAMSES_TRAILER) {
+    if (this->rx_message_state_ == RX_MSG_COMPLETE && this->rx_message_checksum_ == 0) {
+      this->rx_valid_frame_count_++;
+      this->log_valid_frame_();
+      this->reset_rx_frame_();
+    } else {
+      this->reject_rx_frame_("trailer before complete message or invalid checksum");
+    }
+    return;
+  }
+
+  if (++this->rx_encoded_byte_count_ >= RAMSES_MAX_ENCODED_BYTES) {
+    this->reject_rx_frame_("encoded frame exceeds upstream MAX_RAW limit");
+    return;
+  }
+
+  const uint8_t low_code = MANCHESTER_DECODE[byte & 0x0F];
+  const uint8_t high_code = MANCHESTER_DECODE[(byte >> 4) & 0x0F];
+  if (low_code == 0x0F || high_code == 0x0F) {
+    this->reject_rx_frame_("invalid Manchester code");
+    return;
+  }
+
+  // This is the upstream frame.c nibble order: low encoded nibble first,
+  // high encoded nibble second, assembled into a decoded message byte.
+  const uint8_t decoded_nibble = low_code | (high_code << 2);
+  if (!this->rx_have_half_nibble_) {
+    this->rx_half_nibble_ = decoded_nibble;
+    this->rx_have_half_nibble_ = true;
+    return;
+  }
+
+  const uint8_t message_byte = static_cast<uint8_t>((this->rx_half_nibble_ << 4) | decoded_nibble);
+  this->rx_have_half_nibble_ = false;
+  if (!this->process_message_byte_(message_byte))
+    this->reject_rx_frame_("invalid RAMSES message structure");
+}
+
+bool RamsesEsp::process_message_byte_(uint8_t byte) {
+  this->rx_message_checksum_ = static_cast<uint8_t>(this->rx_message_checksum_ + byte);
+
+  switch (this->rx_message_state_) {
+    case RX_MSG_HEADER: {
+      this->rx_message_type_ = (byte >> 4) & 0x03;
+      this->rx_address_mask_ = RAMSES_ADDRESS_MASKS[(byte >> 2) & 0x03];
+      this->rx_param_mask_ = static_cast<uint8_t>(((byte & 0x02) ? 0x01 : 0x00) | ((byte & 0x01) ? 0x02 : 0x00));
+      this->rx_address_slot_ = 0;
+      this->rx_address_byte_ = 0;
+      this->rx_param_slot_ = 0;
+
+      while (this->rx_address_slot_ < 3 && (this->rx_address_mask_ & (1U << this->rx_address_slot_)) == 0)
+        this->rx_address_slot_++;
+      if (this->rx_address_slot_ < 3) {
+        this->rx_message_state_ = RX_MSG_ADDRESSES;
+      } else if (this->rx_param_mask_ != 0) {
+        this->rx_message_state_ = RX_MSG_PARAMS;
+      } else {
+        this->rx_message_state_ = RX_MSG_OPCODE;
+      }
+      return true;
+    }
+
+    case RX_MSG_ADDRESSES:
+      this->rx_addresses_[this->rx_address_slot_][this->rx_address_byte_++] = byte;
+      if (this->rx_address_byte_ == 3) {
+        this->rx_address_byte_ = 0;
+        this->rx_address_slot_++;
+        while (this->rx_address_slot_ < 3 && (this->rx_address_mask_ & (1U << this->rx_address_slot_)) == 0)
+          this->rx_address_slot_++;
+        if (this->rx_address_slot_ == 3)
+          this->rx_message_state_ = this->rx_param_mask_ != 0 ? RX_MSG_PARAMS : RX_MSG_OPCODE;
+      }
+      return true;
+
+    case RX_MSG_PARAMS:
+      while (this->rx_param_slot_ < 2 && (this->rx_param_mask_ & (1U << this->rx_param_slot_)) == 0)
+        this->rx_param_slot_++;
+      if (this->rx_param_slot_ >= 2)
+        return false;
+      this->rx_params_[this->rx_param_slot_++] = byte;
+      if (this->rx_param_slot_ >= 2 || (this->rx_param_mask_ & (1U << this->rx_param_slot_)) == 0) {
+        while (this->rx_param_slot_ < 2 && (this->rx_param_mask_ & (1U << this->rx_param_slot_)) == 0)
+          this->rx_param_slot_++;
+        if (this->rx_param_slot_ >= 2)
+          this->rx_message_state_ = RX_MSG_OPCODE;
+      }
+      return true;
+
+    case RX_MSG_OPCODE:
+      this->rx_opcode_[this->rx_opcode_bytes_++] = byte;
+      if (this->rx_opcode_bytes_ == 2)
+        this->rx_message_state_ = RX_MSG_LENGTH;
+      return true;
+
+    case RX_MSG_LENGTH:
+      if (byte > sizeof(this->rx_payload_))
+        return false;
+      this->rx_payload_length_ = byte;
+      this->rx_payload_count_ = 0;
+      this->rx_message_state_ = byte == 0 ? RX_MSG_CHECKSUM : RX_MSG_PAYLOAD;
+      return true;
+
+    case RX_MSG_PAYLOAD:
+      if (this->rx_payload_count_ >= this->rx_payload_length_ || this->rx_payload_count_ >= sizeof(this->rx_payload_))
+        return false;
+      this->rx_payload_[this->rx_payload_count_++] = byte;
+      if (this->rx_payload_count_ == this->rx_payload_length_)
+        this->rx_message_state_ = RX_MSG_CHECKSUM;
+      return true;
+
+    case RX_MSG_CHECKSUM:
+      this->rx_message_state_ = RX_MSG_COMPLETE;
+      return true;
+
+    case RX_MSG_COMPLETE:
+    default:
+      return false;
+  }
+}
+
+void RamsesEsp::reset_rx_frame_() {
+  this->rx_frame_active_ = false;
+  this->rx_sync_buffer_ = 0;
+  this->rx_have_half_nibble_ = false;
+  this->rx_half_nibble_ = 0;
+  this->rx_message_state_ = RX_MSG_HEADER;
+  this->rx_message_checksum_ = 0;
+  this->rx_message_type_ = 0;
+  this->rx_address_mask_ = 0;
+  this->rx_param_mask_ = 0;
+  this->rx_encoded_byte_count_ = 0;
+  this->rx_address_slot_ = 0;
+  this->rx_address_byte_ = 0;
+  this->rx_param_slot_ = 0;
+  this->rx_opcode_bytes_ = 0;
+  this->rx_payload_length_ = 0;
+  this->rx_payload_count_ = 0;
+}
+
+void RamsesEsp::reject_rx_frame_(const char *reason) {
+  this->rx_rejected_frame_count_++;
+  ESP_LOGW(TAG, "Rejected RAMSES frame (count=%lu): %s",
+           static_cast<unsigned long>(this->rx_rejected_frame_count_), reason);
+  this->reset_rx_frame_();
+}
+
+void RamsesEsp::log_valid_frame_() {
+  static const char *const TYPES[] = {"RQ", "I", "W", "RP"};
+  char payload_hex[sizeof(this->rx_payload_) * 2 + 1];
+  static const char HEX[] = "0123456789ABCDEF";
+  for (uint8_t i = 0; i < this->rx_payload_length_; i++) {
+    payload_hex[i * 2] = HEX[this->rx_payload_[i] >> 4];
+    payload_hex[i * 2 + 1] = HEX[this->rx_payload_[i] & 0x0F];
+  }
+  payload_hex[this->rx_payload_length_ * 2] = '\0';
+
+  char addresses[3][12];
+  for (uint8_t slot = 0; slot < 3; slot++) {
+    if ((this->rx_address_mask_ & (1U << slot)) == 0) {
+      std::snprintf(addresses[slot], sizeof(addresses[slot]), "--:------");
+    } else {
+      const uint8_t *addr = this->rx_addresses_[slot];
+      const uint8_t device_class = (addr[0] & 0xFC) >> 2;
+      const uint32_t id = (static_cast<uint32_t>(addr[0] & 0x03) << 16) |
+                          (static_cast<uint32_t>(addr[1]) << 8) | addr[2];
+      std::snprintf(addresses[slot], sizeof(addresses[slot]), "%02u:%06lu", static_cast<unsigned>(device_class),
+                    static_cast<unsigned long>(id));
+    }
+  }
+
+  ESP_LOGI(TAG, "Valid RAMSES frame #%lu type=%s addr0=%s addr1=%s addr2=%s opcode=%02X%02X payload_len=%u payload=%s",
+           static_cast<unsigned long>(this->rx_valid_frame_count_), TYPES[this->rx_message_type_], addresses[0],
+           addresses[1], addresses[2], this->rx_opcode_[0], this->rx_opcode_[1], this->rx_payload_length_, payload_hex);
 }
 
 uint8_t RamsesEsp::read_register_(uint8_t address) {
