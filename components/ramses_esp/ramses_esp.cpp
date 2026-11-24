@@ -10,7 +10,12 @@ namespace ramses_esp {
 static const char *const TAG = "ramses_esp";
 static const uint32_t CC1101_RESET_TIMEOUT_MS = 100;
 static const uint8_t CC_MARCSTATE_IDLE = 0x01;
+static const uint8_t CC_MARCSTATE_RX = 0x0D;
 static const uint8_t CC_MARCSTATE_MASK = 0x1F;
+static const uint8_t CC_RX_TIMEOUT_MS = 100;
+static const uint8_t CC_PKTCTRL0_ASYNC_INFINITE = 0x32;
+static const uint8_t CC_IOCFG0_UNUSED = 0x2E;
+static const uint32_t RAMSES_SYNC_WORD = 0x00335553;
 
 #ifndef RAMSES_ESP_SOURCE_INFO
 #define RAMSES_ESP_SOURCE_INFO "source metadata unavailable"
@@ -31,13 +36,73 @@ void RamsesEsp::setup() {
     return;
   }
 
-  ESP_LOGI(TAG, "CC1101 initialized with the RAMSES 868.3 MHz register profile");
+  if (!this->start_rx_()) {
+    ESP_LOGE(TAG, "CC1101 failed to enter RX mode");
+    this->mark_failed();
+    return;
+  }
+
+  ESP_LOGI(TAG, "CC1101 initialized with the RAMSES 868.3 MHz profile; RX sync detection is active");
+}
+
+void RamsesEsp::loop() {
+  // Drain bytes buffered by ESPHome's UART component without blocking the main loop.
+  this->read_available([this](uint8_t byte) { this->process_rx_byte_(byte); });
+
+  const uint32_t now = millis();
+  if (now - this->rx_report_ms_ >= 5000) {
+    ESP_LOGD(TAG, "UART RX bytes=%lu, RAMSES syncs=%lu",
+             static_cast<unsigned long>(this->rx_byte_count_),
+             static_cast<unsigned long>(this->rx_sync_count_));
+    this->rx_report_ms_ = now;
+  }
 }
 
 void RamsesEsp::dump_config() {
   ESP_LOGCONFIG(TAG, "RAMSES ESP:");
   ESP_LOGCONFIG(TAG, "  CC1101 SPI: mode 0, MSB first, 1 MHz");
-  ESP_LOGCONFIG(TAG, "  Radio profile: 868.3 MHz (initialization only; RX/TX is not started)");
+  ESP_LOGCONFIG(TAG, "  Radio profile: 868.3 MHz GFSK, 38.4 kbaud UART RX");
+  ESP_LOGCONFIG(TAG, "  RX: RAMSES sync detection enabled; TX is not started");
+}
+
+bool RamsesEsp::start_rx_() {
+  // Follow the upstream RX mode: asynchronous serial output on GDO2 and an
+  // infinite-length asynchronous packet. GDO0 is unused during this RX-only stage.
+  this->strobe_(CC_SIDLE);
+  this->write_register_(CC_IOCFG0, CC_IOCFG0_UNUSED);
+  this->write_register_(CC_PKTCTRL0, CC_PKTCTRL0_ASYNC_INFINITE);
+  this->strobe_(CC_SFRX);
+  this->strobe_(CC_SRX);
+
+  const uint32_t started = millis();
+  uint8_t marcstate = this->read_register_(CC_MARCSTATE) & CC_MARCSTATE_MASK;
+  while (marcstate != CC_MARCSTATE_RX && (millis() - started) < CC_RX_TIMEOUT_MS) {
+    delay(1);
+    marcstate = this->read_register_(CC_MARCSTATE) & CC_MARCSTATE_MASK;
+  }
+
+  if (marcstate != CC_MARCSTATE_RX) {
+    ESP_LOGE(TAG, "CC1101 did not enter RX within %u ms (MARCSTATE=0x%02X)",
+             static_cast<unsigned>(CC_RX_TIMEOUT_MS), marcstate);
+    return false;
+  }
+
+  this->rx_sync_buffer_ = 0;
+  this->rx_sync_count_ = 0;
+  this->rx_byte_count_ = 0;
+  this->rx_report_ms_ = millis();
+  ESP_LOGI(TAG, "CC1101 MARCSTATE=0x%02X (RX); waiting for RAMSES sync 00 33 55 53", marcstate);
+  return true;
+}
+
+void RamsesEsp::process_rx_byte_(uint8_t byte) {
+  this->rx_byte_count_++;
+  this->rx_sync_buffer_ = (this->rx_sync_buffer_ << 8) | byte;
+  if (this->rx_sync_buffer_ == RAMSES_SYNC_WORD) {
+    this->rx_sync_count_++;
+    ESP_LOGI(TAG, "RAMSES sync detected on UART RX (count=%lu)",
+             static_cast<unsigned long>(this->rx_sync_count_));
+  }
 }
 
 uint8_t RamsesEsp::read_register_(uint8_t address) {

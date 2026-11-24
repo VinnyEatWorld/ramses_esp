@@ -27,7 +27,17 @@ spi:
   mosi_pin: 23
   miso_pin: 19
 
+uart:
+  id: ramses_uart
+  rx_pin: 35
+  baud_rate: 38400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_full_threshold: 1
+
 ramses_esp:
   id: ramses_gateway_radio
   spi_id: ramses_spi
+  uart_id: ramses_uart
   cs_pin: 15

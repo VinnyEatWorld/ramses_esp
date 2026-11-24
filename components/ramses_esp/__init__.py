@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import spi
-from esphome.const import CONF_CS_PIN, CONF_ID
+from esphome.components import spi, uart
+from esphome.const import CONF_CS_PIN, CONF_ID, CONF_UART_ID
 from esphome.core import CORE
 from esphome.components.external_components import get_sources
 from esphome.helpers import cpp_string_escape
@@ -9,19 +9,23 @@ import logging
 import subprocess
 from pathlib import Path
 
-DEPENDENCIES = ["spi"]
+DEPENDENCIES = ["spi", "uart"]
 
 ramses_esp_ns = cg.esphome_ns.namespace("ramses_esp")
-RamsesEsp = ramses_esp_ns.class_("RamsesEsp", cg.Component, spi.SPIDevice)
+RamsesEsp = ramses_esp_ns.class_("RamsesEsp", cg.Component, spi.SPIDevice, uart.UARTDevice)
 
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(RamsesEsp),
+        cv.Required(CONF_UART_ID): cv.use_id(uart.UARTComponent),
     }
 ).extend(spi.spi_device_schema(cs_pin_required=True)).extend(cv.COMPONENT_SCHEMA)
 
 _SPI_FINAL_VALIDATE_SCHEMA = spi.final_validate_device_schema(
     "ramses_esp", require_mosi=True, require_miso=True
+)
+_UART_FINAL_VALIDATE_SCHEMA = uart.final_validate_device_schema(
+    "ramses_esp", baud_rate=38400, require_rx=True, data_bits=8, parity="NONE", stop_bits=1
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,6 +61,7 @@ def _source_info():
 
 def _validate_strapping_pin(config):
     config = _SPI_FINAL_VALIDATE_SCHEMA(config)
+    config = _UART_FINAL_VALIDATE_SCHEMA(config)
     cs_pin = config[CONF_CS_PIN]
     pin_number = cs_pin.get("number") if isinstance(cs_pin, dict) else cs_pin
     if CORE.is_esp32 and pin_number in _ESP32_STRAPPING_PINS:
@@ -78,3 +83,5 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     await spi.register_spi_device(var, config)
+    uart_var = await cg.get_variable(config[CONF_UART_ID])
+    cg.add(var.set_uart_parent(uart_var))

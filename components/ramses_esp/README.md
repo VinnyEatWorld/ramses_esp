@@ -1,12 +1,14 @@
 # `ramses_esp` ESPHome component
 
-Phase 1 adds CC1101 initialization on an ESPHome SPI bus. It does not start
-radio RX/TX, install an IDF SPI bus, configure the radio UART, or publish MQTT.
+The initial RX phase configures the CC1101 on an ESPHome SPI bus, starts the
+upstream RAMSES asynchronous GFSK receive mode, and scans ESPHome UART input for
+the RAMSES frame sync word. It does not add TX or MQTT.
 
-The component requires an ESPHome `spi:` bus with MOSI and MISO and a separate
-CS pin. It attaches to that bus through ESPHome's SPI-device API. If the node
-already defines the SPI bus, set `spi_id` to its ID instead of defining it
-again.
+The component requires an ESPHome `spi:` bus with MOSI and MISO, a separate CS
+pin, and an ESPHome `uart:` bus configured for 38400 baud, 8 data bits, no
+parity, and one stop bit. It attaches to the SPI bus through ESPHome's
+SPI-device API and reads bytes through ESPHome's UART component. If the node
+already defines either bus, reference its ID instead of defining it again.
 
 ```yaml
 external_components:
@@ -22,8 +24,18 @@ spi:
   mosi_pin: <existing MOSI pin>
   miso_pin: <existing MISO pin>
 
+uart:
+  id: ramses_uart
+  rx_pin: <GPIO connected to CC1101 GDO2>
+  baud_rate: 38400
+  data_bits: 8
+  parity: NONE
+  stop_bits: 1
+  rx_full_threshold: 1
+
 ramses_esp:
   spi_id: ramses_spi
+  uart_id: ramses_uart
   cs_pin: <GPIO selected for CC1101 CSN>
 ```
 
@@ -51,13 +63,18 @@ logs PARTNUM/VERSION and MARCSTATE, writes the existing RAMSES 868.3 MHz
 register and PA profiles, and checks the frequency, modem, packet, sync, and
 AGC configuration by register readback. Register operations follow the
 upstream two-byte SPI transaction shape with separate TX and RX buffers. It
-verifies MARCSTATE is IDLE and leaves the radio there for later frame/UART work.
+then applies the upstream asynchronous RX settings (`IOCFG0=0x2E`,
+`PKTCTRL0=0x32`), flushes the RX FIFO, starts RX, and verifies `MARCSTATE=RX`.
+The ESPHome main loop drains UART bytes non-blockingly, reports UART byte and
+sync counters every five seconds, and logs each detection of the upstream
+RAMSES sync sequence `00 33 55 53`; this phase does not decode message payloads
+yet.
 
 The RF profile is inherited from `components/cc1101/cc1101_param.c` (also
 vendored as `cc1101_param.c` in this external component). It sets FREQ2/1/0 to
 `0x21/0x65/0x6A` (868.3 MHz with the CC1101 26 MHz crystal), `MDMCFG4/3` to
 `0x6A/0x83` (about 38.383 kbit/s), `MDMCFG2` to `0x10` (GFSK, no hardware sync),
 `DEVIATN` to `0x50`, and FIFO packet mode values as listed in that source.
-These are upstream project settings, not newly calculated or hardware-verified
-values. The present phase configures them but does not start RF reception or
-transmission.
+These are upstream project settings, not newly calculated values. The current
+RX phase listens for the raw demodulated stream; it does not transmit or
+publish MQTT.
