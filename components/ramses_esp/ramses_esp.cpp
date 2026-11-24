@@ -3,6 +3,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "cc1101_param.h"
+#include "ramses_payload.h"
 
 #include <cstdio>
 
@@ -69,6 +70,13 @@ void RamsesEsp::loop() {
   this->read_available([this](uint8_t byte) { this->process_rx_byte_(byte); });
 
   const uint32_t now = millis();
+  if (this->co2_sensor_present_ && this->has_seen_co2_sensor_ &&
+      now - this->last_co2_sensor_seen_ms_ >= this->sensor_timeout_ms_) {
+    this->co2_sensor_present_ = false;
+    if (this->co2_presence_sensor_ != nullptr)
+      this->co2_presence_sensor_->publish_state(false);
+    ESP_LOGI(TAG, "Configured CO2 sensor %s has timed out", this->co2_sensor_id_.c_str());
+  }
   if (now - this->rx_report_ms_ >= 5000) {
     ESP_LOGD(TAG, "UART RX bytes=%lu, syncs=%lu, valid frames=%lu, rejected frames=%lu",
              static_cast<unsigned long>(this->rx_byte_count_),
@@ -84,6 +92,8 @@ void RamsesEsp::dump_config() {
   ESP_LOGCONFIG(TAG, "  CC1101 SPI: mode 0, MSB first, 1 MHz");
   ESP_LOGCONFIG(TAG, "  Radio profile: 868.3 MHz GFSK, 38.4 kbaud UART RX");
   ESP_LOGCONFIG(TAG, "  RX: RAMSES Manchester/message validation enabled; TX is not started");
+  ESP_LOGCONFIG(TAG, "  Filtered telemetry: paired fan and learned peers; sensor timeout=%lu s",
+                static_cast<unsigned long>(this->sensor_timeout_ms_ / 1000UL));
 }
 
 bool RamsesEsp::start_rx_() {
@@ -142,6 +152,7 @@ void RamsesEsp::process_rx_frame_byte_(uint8_t byte) {
     if (this->rx_message_state_ == RX_MSG_COMPLETE && this->rx_message_checksum_ == 0) {
       this->rx_valid_frame_count_++;
       this->log_valid_frame_();
+      this->process_application_frame_();
       this->reset_rx_frame_();
     } else {
       this->reject_rx_frame_("trailer before complete message or invalid checksum");
@@ -174,6 +185,138 @@ void RamsesEsp::process_rx_frame_byte_(uint8_t byte) {
   this->rx_have_half_nibble_ = false;
   if (!this->process_message_byte_(message_byte))
     this->reject_rx_frame_("invalid RAMSES message structure");
+}
+
+bool RamsesEsp::address_matches_(uint8_t slot, const std::string &expected) const {
+  return !expected.empty() && this->address_string_(slot) == expected;
+}
+
+std::string RamsesEsp::address_string_(uint8_t slot) const {
+  if (slot >= 3 || (this->rx_address_mask_ & (1U << slot)) == 0)
+    return {};
+  const uint8_t *addr = this->rx_addresses_[slot];
+  const uint8_t device_class = (addr[0] & 0xFC) >> 2;
+  const uint32_t device_id = (static_cast<uint32_t>(addr[0] & 0x03) << 16) |
+                             (static_cast<uint32_t>(addr[1]) << 8) | addr[2];
+  char formatted[12];
+  std::snprintf(formatted, sizeof(formatted), "%02u:%06lu", static_cast<unsigned>(device_class),
+                static_cast<unsigned long>(device_id));
+  return formatted;
+}
+
+void RamsesEsp::set_fan_id(const std::string &id) {
+  if (this->fan_id_ == id)
+    return;
+  this->fan_id_ = id;
+  this->observed_remote_id_.clear();
+  this->co2_sensor_id_.clear();
+  this->has_seen_co2_sensor_ = false;
+  this->co2_sensor_present_ = false;
+  this->has_co2_ppm_ = false;
+  this->has_boost_duration_ = false;
+  this->last_fan_mode_.clear();
+}
+
+void RamsesEsp::mark_co2_sensor_seen_() {
+  this->last_co2_sensor_seen_ms_ = millis();
+  this->has_seen_co2_sensor_ = true;
+  if (!this->co2_sensor_present_) {
+    this->co2_sensor_present_ = true;
+    if (this->co2_presence_sensor_ != nullptr)
+      this->co2_presence_sensor_->publish_state(true);
+    ESP_LOGI(TAG, "Paired CO2 sensor %s detected", this->co2_sensor_id_.c_str());
+  }
+}
+
+void RamsesEsp::publish_fan_mode_(uint8_t mode) {
+  // This is the Orcon 3-byte 31D9 mode field mapping used by ramses_rf.
+  static const char *const MODES[] = {"Away", "Low", "Medium", "High", "Auto", "Auto (alternate)", "Boost", "Off"};
+  char value[24];
+  if (mode < sizeof(MODES) / sizeof(MODES[0]))
+    std::snprintf(value, sizeof(value), "%s", MODES[mode]);
+  else
+    std::snprintf(value, sizeof(value), "Unknown (0x%02X)", mode);
+  if (this->last_fan_mode_ == value)
+    return;
+  this->last_fan_mode_ = value;
+  if (this->fan_mode_sensor_ != nullptr)
+    this->fan_mode_sensor_->publish_state(this->last_fan_mode_);
+  ESP_LOGI(TAG, "MVS %s reported fan mode %s", this->fan_id_.c_str(), value);
+}
+
+void RamsesEsp::process_application_frame_() {
+  // The observations used here are checksum-validated Information frames.
+  if (this->rx_message_type_ != 1)
+    return;
+
+  const uint16_t opcode = (static_cast<uint16_t>(this->rx_opcode_[0]) << 8) | this->rx_opcode_[1];
+  bool from_co2 = this->address_matches_(0, this->co2_sensor_id_);
+  const bool from_fan = this->address_matches_(0, this->fan_id_);
+  const bool to_fan = this->address_matches_(1, this->fan_id_);
+
+  // The fan address is supplied by the completed explicit pairing flow.
+  // Learn its CO2 sensor from a paired 31E0 exchange, and a physical remote
+  // from its first mode/timer command addressed to that fan. This avoids
+  // embedding captured RAMSES identities or selecting unrelated RF neighbors.
+  if (this->fan_id_.empty())
+    return;
+
+  if (opcode == 0x31E0 && to_fan && this->rx_payload_length_ == 8) {
+    if (this->co2_sensor_id_.empty()) {
+      this->co2_sensor_id_ = this->address_string_(0);
+      ESP_LOGI(TAG, "Learned CO2 sensor identity from paired 31E0 traffic");
+      from_co2 = true;
+    }
+    if (from_co2)
+      this->mark_co2_sensor_seen_();
+    return;
+  }
+
+  if ((opcode == 0x22F1 || opcode == 0x22F3) && to_fan && this->observed_remote_id_.empty()) {
+    this->observed_remote_id_ = this->address_string_(0);
+    ESP_LOGI(TAG, "Learned remote identity from a command addressed to the paired fan");
+  }
+
+  if (opcode == 0x1298 && from_co2 && this->rx_payload_length_ == 3) {
+    uint16_t ppm;
+    if (decode_co2_payload(this->rx_payload_, this->rx_payload_length_, &ppm)) {
+      this->mark_co2_sensor_seen_();
+      if (!this->has_co2_ppm_ || ppm != this->last_co2_ppm_) {
+        this->has_co2_ppm_ = true;
+        this->last_co2_ppm_ = ppm;
+        if (this->co2_sensor_ != nullptr)
+          this->co2_sensor_->publish_state(ppm);
+        ESP_LOGI(TAG, "CO2 sensor %s reports %u ppm", this->co2_sensor_id_.c_str(), ppm);
+      }
+    } else {
+      ESP_LOGW(TAG, "CO2 sensor %s reported a protocol fault value 0x%04X", this->co2_sensor_id_.c_str(), ppm);
+    }
+    return;
+  }
+
+  if (opcode == 0x31D9 && from_fan && this->rx_payload_length_ == 3) {
+    uint8_t mode;
+    if (decode_orcon_fan_mode(this->rx_payload_, this->rx_payload_length_, &mode))
+      this->publish_fan_mode_(mode);
+    return;
+  }
+
+  if (opcode == 0x22F3 && this->address_matches_(0, this->observed_remote_id_) && to_fan &&
+      this->rx_payload_length_ == 7) {
+    OrconBoostTimer timer;
+    // The learned remote identity prevents other nearby installations reaching this.
+    if (decode_orcon_boost_timer(this->rx_payload_, this->rx_payload_length_, &timer)) {
+      if (!this->has_boost_duration_ || timer.minutes != this->last_boost_duration_minutes_) {
+        this->has_boost_duration_ = true;
+        this->last_boost_duration_minutes_ = timer.minutes;
+        if (this->boost_duration_sensor_ != nullptr)
+          this->boost_duration_sensor_->publish_state(timer.minutes);
+        ESP_LOGI(TAG, "Paired remote requested %u-minute Orcon boost (speed=%u)", timer.minutes, timer.speed);
+      }
+    } else {
+      ESP_LOGD(TAG, "Ignored unsupported 22F3 dialect from learned remote");
+    }
+  }
 }
 
 bool RamsesEsp::process_message_byte_(uint8_t byte) {

@@ -41,3 +41,26 @@ ramses_esp:
   spi_id: ramses_spi
   uart_id: ramses_uart
   cs_pin: 15
+  # RAMSES unit and peer IDs are learned through the explicit binding flow.
+
+sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: co2
+    name: "Ventilation CO2"
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: boost_duration
+    name: "Requested boost duration"
+
+text_sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: fan_mode
+    name: "Ventilation mode"
+
+binary_sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: co2_sensor_presence
+    name: "CO2 sensor presence"

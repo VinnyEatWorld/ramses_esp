@@ -35,10 +35,42 @@ uart:
   rx_full_threshold: 1
 
 ramses_esp:
+  id: ramses_gateway_radio
   spi_id: ramses_spi
   uart_id: ramses_uart
   cs_pin: <GPIO selected for CC1101 CSN>
+
+sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: co2
+    name: Ventilation CO2
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: boost_duration
+    name: Requested boost duration
+
+text_sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: fan_mode
+    name: Ventilation mode
+
+binary_sensor:
+  - platform: ramses_esp
+    ramses_esp_id: ramses_gateway_radio
+    type: co2_sensor_presence
+    name: CO2 sensor presence
 ```
+
+RAMSES IDs are deliberately absent from the public configuration. The explicit
+binding flow will learn the fan ID from the exchange, then associate the CO2
+sensor and remote from traffic addressed to that fan. Until binding support is
+implemented and completed, the filtered telemetry entities remain without a
+state. `sensor_timeout` is seconds (default 1800) and controls when the CO2
+presence binary sensor changes to off after the last valid `1298` or paired
+`31E0` message. The boost entity reports the duration requested by a remote; it
+is not a confirmed countdown from the fan.
 
 The example at `examples/ramses_esp_m5stack_core.yaml` uses the M5Stack Core
 Basic/M146 M5-Bus SPI pins and routes CSN to GPIO15. The M5Stack M146 schematic

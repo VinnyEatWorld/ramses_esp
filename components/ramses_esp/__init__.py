@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import spi, uart
+from esphome.components import binary_sensor, sensor, spi, text_sensor, uart
 from esphome.const import CONF_CS_PIN, CONF_ID, CONF_UART_ID
 from esphome.core import CORE
 from esphome.components.external_components import get_sources
@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 DEPENDENCIES = ["spi", "uart"]
+AUTO_LOAD = ["binary_sensor", "sensor", "text_sensor"]
 
 ramses_esp_ns = cg.esphome_ns.namespace("ramses_esp")
 RamsesEsp = ramses_esp_ns.class_("RamsesEsp", cg.Component, spi.SPIDevice, uart.UARTDevice)
@@ -18,6 +19,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(RamsesEsp),
         cv.Required(CONF_UART_ID): cv.use_id(uart.UARTComponent),
+        cv.Optional("sensor_timeout", default=1800): cv.int_range(min=60, max=86400),
     }
 ).extend(spi.spi_device_schema(cs_pin_required=True)).extend(cv.COMPONENT_SCHEMA)
 
@@ -85,3 +87,4 @@ async def to_code(config):
     await spi.register_spi_device(var, config)
     uart_var = await cg.get_variable(config[CONF_UART_ID])
     cg.add(var.set_uart_parent(uart_var))
+    cg.add(var.set_sensor_timeout_seconds(config["sensor_timeout"]))
