@@ -36,7 +36,7 @@ void RamsesEsp::setup() {
 
 void RamsesEsp::dump_config() {
   ESP_LOGCONFIG(TAG, "RAMSES ESP:");
-  ESP_LOGCONFIG(TAG, "  CC1101 SPI: mode 0, MSB first, 10 MHz");
+  ESP_LOGCONFIG(TAG, "  CC1101 SPI: mode 0, MSB first, 1 MHz");
   ESP_LOGCONFIG(TAG, "  Radio profile: 868.3 MHz (initialization only; RX/TX is not started)");
 }
 
