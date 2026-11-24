@@ -12,12 +12,17 @@ static const uint32_t CC1101_RESET_TIMEOUT_MS = 100;
 static const uint8_t CC_MARCSTATE_IDLE = 0x01;
 static const uint8_t CC_MARCSTATE_MASK = 0x1F;
 
+#ifndef RAMSES_ESP_SOURCE_INFO
+#define RAMSES_ESP_SOURCE_INFO "source metadata unavailable"
+#endif
+
 struct RegisterCheck {
   uint8_t address;
   const char *name;
 };
 
 void RamsesEsp::setup() {
+  ESP_LOGI(TAG, "Component source: %s", RAMSES_ESP_SOURCE_INFO);
   this->spi_setup();
 
   if (!this->initialize_cc1101_()) {
